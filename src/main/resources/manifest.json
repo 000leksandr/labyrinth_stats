@@ -1,0 +1,12 @@
+{
+  "Group": "Labyrinth",
+  "Name": "StatsPLugin",
+  "Version": "1.0.0",
+  "IncludesAssetPack": true,
+  "UnifiedData": "*",
+  "Description": "StatsPLugin",
+  "Main": "com.labyrinth.hytale.Main",
+  "Authors": [
+    { "Name": "Oleksandr leksus" }
+  ]
+}
