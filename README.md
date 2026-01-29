@@ -83,13 +83,16 @@ com.labyrinth.hytale
 │   ├── BalanceCom.java
 │   └── StatsCom.java
 ├── 📁 listeners
-│   ├── PlayerSessionTrackerUD.java
-│   └── MobKillStatsEvent.java
-└── 📁 udata
-    ├── PlayerDataPaths.java
-    ├── PlayerDataRepository.java
-    ├── PlayerStatsSnapshot.java
-    └── UuidUtil.java
+│   ├── MobKillStatsEvent.java
+│   └── PlayerSessionTrackerUD.java
+├── 📁 udata
+│   ├── PlayerDataPaths.java
+│   ├── PlayerDataRepository.java
+│   ├── PlayerStatsSnapshot.java
+│   └── UuidUtil.java
+├── 📄 BlockBreakDenyEvent.java
+├── 📄 CustomMoney.java
+└── 📄 DamageChatDebugEvent.java
 ```
 
 **Each package has a single responsibility with no overlap.**
@@ -143,6 +146,34 @@ public static final String MOBS_KILLED_BY_ID_ROOT = "stats.mobsKilledById";
 
 Centralizes all storage logic with atomic, thread-safe operations.
 
+#### Core Methods
+
+```java
+// Initialize new player
+CompletableFuture<Void> ensureDefaults(String uuid, String nickname)
+
+// Money operations
+CompletableFuture<Integer> addMoney(String uuid, int delta)
+CompletableFuture<Integer> getMoney(String uuid)
+
+// Playtime
+CompletableFuture<Long> addPlaytimeSeconds(String uuid, long seconds)
+
+// Login tracking
+CompletableFuture<Void> incrementLoginCount(String uuid)
+CompletableFuture<Void> setLastSeenNow(String uuid)
+
+// Mob statistics
+CompletableFuture<Void> incrementMobsKilledTotal(String uuid)
+CompletableFuture<Void> incrementMobKilledById(String uuid, String mobIdSanitized)
+
+// Coin tracking
+CompletableFuture<Void> addCoinsConsumed(String uuid, int qty)
+
+// Snapshot for commands
+CompletableFuture<PlayerStatsSnapshot> getSnapshot(String uuid)
+```
+
 #### Key Operations
 
 | Operation | Action |
@@ -153,33 +184,99 @@ Centralizes all storage logic with atomic, thread-safe operations.
 | 🪙 **Coins** | `stats.coinsConsumed += qty` |
 | 🔑 **Logins** | `stats.loginCount += 1` |
 
+#### Default Values
+
+When `ensureDefaults()` is called for a new player:
+
+```java
+{
+    "nickname": playerName,
+    "currencies.money": 0,
+    "stats.playTimeSeconds": 0,
+    "stats.loginCount": 0,
+    "stats.lastSeenEpochMs": 0,
+    "stats.mobsKilled": 0,
+    "stats.coinsConsumed": 0
+}
+```
+
+**Note:** `mobsKilledById` is not pre-created; UnifiedData creates nested objects automatically on first write.
+
 **Every update is atomic and thread-safe.**
 
 ---
 
 ### PlayerSessionTrackerUD
 
-**Tracks player join and leave events.**
+**Tracks player join and leave events with thread-safe session management.**
 
-#### On Join
-- ✅ Creates default data if player is new
-- ✅ Increments login count
-
-#### On Leave
-- 📊 Calculates session time
-- 💾 Adds to total playtime
-- 🕒 Updates `lastSeen` timestamp
+#### Session Storage
 
 ```java
-sessionSeconds = now - joinTime
+private static final ConcurrentHashMap<String, Long> joinNano = new ConcurrentHashMap<>();
+```
+
+Stores join timestamps in nanoseconds for precise playtime calculation.
+
+#### On Join (`PlayerReadyEvent`)
+
+```java
+public static void onJoin(PlayerReadyEvent event) {
+    // 1. Record join time
+    joinNano.put(uuid, System.nanoTime());
+    
+    // 2. Initialize player data if new
+    repo.ensureDefaults(uuid, nickname)
+        .thenCompose(v -> repo.incrementLoginCount(uuid))
+        .exceptionally(ex -> {
+            Main.LOGGER.atSevere().log("[UnifiedData] onJoin error: " + ex);
+            return null;
+        });
+}
+```
+
+- ✅ Creates default data if player is new
+- ✅ Increments login count
+- ✅ Records session start time
+
+#### On Leave (`PlayerDisconnectEvent`)
+
+```java
+public static void onLeave(PlayerDisconnectEvent event) {
+    Long start = joinNano.remove(uuid);
+    if (start == null) return;
+    
+    long sessionSeconds = (long) ((System.nanoTime() - start) / 1_000_000_000.0);
+    if (sessionSeconds <= 0) return;
+    
+    repo.addPlaytimeSeconds(uuid, sessionSeconds)
+        .thenCompose(v -> repo.setLastSeenNow(uuid))
+        .exceptionally(ex -> {
+            Main.LOGGER.atSevere().log("[UnifiedData] onLeave error: " + ex);
+            return null;
+        });
+}
+```
+
+- 📊 Calculates session duration in seconds
+- 💾 Adds to total playtime
+- 🕒 Updates `lastSeenEpochMs` timestamp
+- 🧹 Removes session from memory
+
+#### Playtime Calculation
+
+```java
+sessionSeconds = (System.nanoTime() - joinTime) / 1_000_000_000.0
 stats.playTimeSeconds += sessionSeconds
 ```
+
+**Uses nanosecond precision for accuracy.**
 
 ---
 
 ### MobKillStatsEvent
 
-**Triggered when a mob dies.**
+**Triggered when a mob dies (ECS System).**
 
 When a player kills an entity:
 
@@ -188,12 +285,44 @@ stats.mobsKilled += 1
 stats.mobsKilledById.<mobId> += 1
 ```
 
+#### Mob ID Resolution Priority
+
+1. **NPCEntity component** → `npcTypeId` (e.g., `Skeleton_Ranger`)
+2. **Entity class identifier** → from `EntityModule.getIdentifier()`
+3. **Fallback** → `UNKNOWN`
+
+#### Path Key Sanitization
+
+Mob IDs are sanitized to ensure safe JSON path usage:
+
+```java
+private String sanitizePathKey(String raw) {
+    StringBuilder sb = new StringBuilder(raw.length());
+    for (int idx = 0; idx < raw.length(); idx++) {
+        char c = raw.charAt(idx);
+        
+        boolean ok = (c >= 'a' && c <= 'z') ||
+                     (c >= 'A' && c <= 'Z') ||
+                     (c >= '0' && c <= '9') ||
+                     c == '_' || c == '-';
+        
+        sb.append(ok ? c : '_');
+    }
+    return sb.toString();
+}
+```
+
+**Replaces:** `.`, `[`, `]`, `/`, `\`, spaces, `:`, and other special characters with `_`
+
+**Keeps only:** letters, digits, `_`, and `-`
+
 #### Example Output
 
 ```json
 "mobsKilledById": {
   "Skeleton_Ranger": 10,
-  "Frog_Orange": 3
+  "Frog_Orange": 3,
+  "Cave_Spider": 5
 }
 ```
 
@@ -210,13 +339,82 @@ When a Coin item is detected:
 2. 💱 Converts coins into money
 3. ➕ Adds money atomically
 4. 📈 Tracks coins consumed
+5. ❤️ Heals player (+3 HP)
 
 ```java
 currencies.money += qty
 stats.coinsConsumed += qty
 ```
 
+**Searches all inventory sections:**
+- Hotbar
+- Storage
+- Utility
+- Armor
+- Backpack
+
 **Fully async and safe under heavy load.**
+
+---
+
+### Additional Components
+
+#### BlockBreakDenyEvent.java
+Custom event handler for block breaking logic.
+
+#### DamageChatDebugEvent.java
+Debug utility for damage event monitoring.
+
+---
+
+## 🚀 Plugin Initialization
+
+### Main.java
+
+The entry point that wires everything together.
+
+#### Setup Phase
+
+```java
+@Override
+public void setup() {
+    // 1. Initialize repository
+    this.playerDataRepository = new PlayerDataRepository();
+    
+    // 2. Register schema indexes (optional, for Data.query support)
+    Data.schema(PlayerDataPaths.ENTITY)
+            .index(PlayerDataPaths.MONEY)
+            .index(PlayerDataPaths.PLAYTIME_SECONDS)
+            .index(PlayerDataPaths.MOBS_KILLED)
+            .register();
+    
+    // 3. Register event listeners
+    getEventRegistry().registerGlobal(PlayerReadyEvent.class, 
+        PlayerSessionTrackerUD::onJoin);
+    getEventRegistry().registerGlobal(PlayerDisconnectEvent.class, 
+        PlayerSessionTrackerUD::onLeave);
+    getEventRegistry().registerGlobal(LivingEntityInventoryChangeEvent.class, 
+        CustomMoney::LivingEntityInventoryChangeEvent);
+    
+    // 4. Register commands
+    getCommandRegistry().registerCommand(new BalanceCom());
+    getCommandRegistry().registerCommand(new StatsCom());
+    
+    // 5. Register ECS systems
+    getEntityStoreRegistry().registerSystem(new MobKillStatsEvent());
+}
+```
+
+#### Shutdown Phase
+
+```java
+@Override
+public void shutdown() {
+    PlayerSessionTrackerUD.clear();
+}
+```
+
+**Singleton Access:** `Main.getInstance()` provides global plugin access.
 
 ---
 
@@ -230,21 +428,53 @@ Shows player money balance.
 Your balance is: 250
 ```
 
+**Implementation:**
+```java
+public BalanceCom() {
+    super("balance", "Check your bank balance");
+}
+
+@Override
+protected void execute(...) {
+    repo.getMoney(uuid).thenAccept(money ->
+        world.execute(() -> 
+            player.sendMessage(Message.raw("Your balance is: " + money))
+        )
+    );
+}
+```
+
 **Reads:** `currencies.money`
 
 ---
 
 ### `/stats`
 
-Displays all tracked statistics.
+Displays all tracked statistics in a single line.
 
 ```
-Stats:
-Money: 250
-Playtime: 02:15:32
-Mobs killed: 42
-Coins consumed: 250
-Logins: 8
+Stats | money=250 | time=02:15:32 | mobsKilled=42 | coinsConsumed=250 | logins=8
+```
+
+**Implementation:**
+```java
+public StatsCom() {
+    super("stats", "Show your player statistics");
+}
+
+@Override
+protected void execute(...) {
+    repo.getSnapshot(uuid).thenAccept(s -> {
+        String time = PlayerStatsSnapshot.formatTime(s.playtimeSeconds);
+        String msg = "Stats | money=" + s.money +
+                " | time=" + time +
+                " | mobsKilled=" + s.mobsKilled +
+                " | coinsConsumed=" + s.coinsConsumed +
+                " | logins=" + s.loginCount;
+        
+        world.execute(() -> player.sendMessage(Message.raw(msg)));
+    });
+}
 ```
 
 **Uses:** `PlayerStatsSnapshot` for formatted output
@@ -263,28 +493,58 @@ Logins: 8
 - 🕐 Format playtime into readable form
 
 #### Contains
-- `uuid`
-- `nickname`
-- `money`
-- `playtimeSeconds`
-- `mobsKilled`
-- `coinsConsumed`
-- `loginCount`
+```java
+public final String uuid;
+public final String nickname;
+public final int money;
+public final long playtimeSeconds;
+public final int mobsKilled;
+public final int coinsConsumed;
+public final int loginCount;
+```
+
+#### Time Formatting
+```java
+public static String formatTime(long seconds) {
+    long total = Math.max(0, seconds);
+    long h = total / 3600;
+    long m = (total % 3600) / 60;
+    long s = total % 60;
+    
+    if (h > 0) return String.format("%02d:%02d:%02d", h, m, s);
+    return String.format("%02d:%02d", m, s);
+}
+```
+
+**Examples:**
+- `7200` seconds → `02:00:00`
+- `150` seconds → `02:30`
 
 ---
 
 ### UUID Handling
 
-UUIDs are extracted using the official Hytale API:
+**UuidUtil.java** extracts UUIDs using the official Hytale API.
 
 ```java
-Ref<EntityStore> ref = player.getReference();
-Store<EntityStore> store = ref.getStore();
-PlayerRef playerRef = store.getComponent(ref, PlayerRef.getComponentType());
-UUID id = playerRef.getUuid();
+public static String uuid(Player player) {
+    Ref<EntityStore> ref = player.getReference();
+    Store<EntityStore> store = ref.getStore();
+    PlayerRef playerRef = store.getComponent(ref, PlayerRef.getComponentType());
+    
+    UUID id = (playerRef == null) ? null : playerRef.getUuid();
+    return id == null ? null : id.toString();
+}
 ```
 
 **UUID is always used as the primary key in UnifiedData.**
+
+Used throughout the codebase:
+- `BalanceCom` - for balance queries
+- `StatsCom` - for stats retrieval
+- `CustomMoney` - for money transactions
+- `PlayerSessionTrackerUD` - for session tracking
+- `MobKillStatsEvent` - for kill statistics
 
 ---
 
